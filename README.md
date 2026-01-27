@@ -80,6 +80,14 @@ python mistral_ocr.py document.pdf --no-images
 | 6 | API processing error |
 | 7 | Invalid page range |
 
+## Limitations
+
+- **50MB file size limit**: The Mistral OCR API accepts documents up to 50MB. For larger files, split them manually using a tool like `pdftk` or `qpdf` before processing. Use the `--pages` option to process specific page ranges.
+
+## Future Enhancements
+
+- [ ] Automatic chunking of large PDFs (>50MB)
+
 ## Development
 
 ### Running Tests
