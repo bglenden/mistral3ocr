@@ -1,6 +1,6 @@
 # mistral-ocr
 
-A CLI tool that converts PDF files to Markdown using the [Mistral OCR API](https://docs.mistral.ai/capabilities/document/).
+A CLI tool that converts PDF files to Markdown using the [Mistral OCR API](https://docs.mistral.ai/capabilities/document_ai/).
 
 Uses **Mistral OCR 3** (`mistral-ocr-latest`), which offers improved handling of:
 - Handwritten and cursive text
