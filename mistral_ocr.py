@@ -10,8 +10,8 @@ import base64
 import os
 import re
 import sys
+import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from io import BytesIO
 from pathlib import Path
 
@@ -337,11 +337,13 @@ def split_pdf_into_chunks(
 
 
 MAX_RETRIES = 3
-MAX_CONCURRENT_CHUNKS = 2
+DEFAULT_RPS = 5
 
 
-def ocr_single_chunk(client, pdf_base64: str, include_images: bool):
+def ocr_single_chunk(client, pdf_base64: str, include_images: bool,
+                     rps: float = DEFAULT_RPS):
     """Send a single base64-encoded PDF to the Mistral OCR API with retry on 429."""
+    base_wait = 1.0 / rps
     for attempt in range(MAX_RETRIES + 1):
         try:
             return client.ocr.process(
@@ -355,9 +357,11 @@ def ocr_single_chunk(client, pdf_base64: str, include_images: bool):
         except Exception as e:
             error_str = str(e).lower()
             is_rate_limit = 'rate limit' in error_str or '429' in error_str
-            if is_rate_limit and attempt < MAX_RETRIES:
-                wait = 2 ** attempt  # 1s, 2s, 4s
-                print(f"  Rate limited, retrying in {wait}s...", flush=True)
+            is_server_error = '500' in error_str or '502' in error_str or '503' in error_str or 'service unavailable' in error_str
+            if (is_rate_limit or is_server_error) and attempt < MAX_RETRIES:
+                wait = base_wait * (2 ** attempt)
+                reason = "Rate limited" if is_rate_limit else "Server error"
+                print(f"  {reason}, retrying in {wait:.1f}s...", flush=True)
                 time.sleep(wait)
                 continue
             raise
@@ -453,14 +457,14 @@ Exit Codes:
     )
 
     parser.add_argument(
-        '--parallel',
-        type=int,
+        '--rps',
+        type=float,
         metavar='N',
-        default=MAX_CONCURRENT_CHUNKS,
-        help=f'''Number of concurrent API requests when processing large files
+        default=DEFAULT_RPS,
+        help=f'''Max API requests per second when processing large files
                 (>50MB) that are automatically split into chunks.
-                Default: {MAX_CONCURRENT_CHUNKS} (should work even on the free tier).
-                Set to 1 to disable parallel processing.'''
+                Default: {DEFAULT_RPS} (Mistral paid plan allows 5-6 RPS;
+                free plan allows 1 RPS, use --rps 1).'''
     )
 
     args = parser.parse_args()
@@ -529,41 +533,49 @@ Exit Codes:
         # Single chunk: no threading overhead
         chunk_b64, chunk_page_indices = chunks[0]
         try:
-            ocr_responses = [ocr_single_chunk(client, chunk_b64, include_images)]
+            ocr_responses = [ocr_single_chunk(client, chunk_b64, include_images,
+                                                rps=args.rps)]
         except Exception as e:
             _handle_api_error(e)
     else:
-        # Multiple chunks: process in parallel
-        num_workers = min(args.parallel, len(chunks))
+        # Multiple chunks: submit at --rps rate, all run concurrently
+        rps = args.rps
+        delay = 1.0 / rps
         print(f"Processing {len(chunks)} chunks "
-              f"({num_workers} concurrent)...", flush=True)
+              f"(submitting at {rps} req/s)...", flush=True)
         ocr_responses = [None] * len(chunks)
         chunk_times = {}
+        error_holder = []
+        lock = threading.Lock()
 
         def process_chunk(idx, b64):
             chunk_start = time.monotonic()
-            print(f"  Chunk {idx + 1}/{len(chunks)}: sending...", flush=True)
-            result = ocr_single_chunk(client, b64, include_images)
-            elapsed = time.monotonic() - chunk_start
-            chunk_times[idx] = elapsed
-            print(f"  Chunk {idx + 1}/{len(chunks)}: done ({elapsed:.1f}s).",
-                  flush=True)
-            return idx, result
-
-        with ThreadPoolExecutor(max_workers=num_workers) as executor:
-            futures = {
-                executor.submit(process_chunk, i, b64): i
-                for i, (b64, _) in enumerate(chunks)
-            }
             try:
-                for future in as_completed(futures):
-                    idx, result = future.result()
+                result = ocr_single_chunk(client, b64, include_images, rps=rps)
+                elapsed = time.monotonic() - chunk_start
+                with lock:
                     ocr_responses[idx] = result
+                    chunk_times[idx] = elapsed
+                print(f"  Chunk {idx + 1}/{len(chunks)}: done ({elapsed:.1f}s).",
+                      flush=True)
             except Exception as e:
-                # Cancel remaining futures on error
-                for f in futures:
-                    f.cancel()
-                _handle_api_error(e)
+                with lock:
+                    error_holder.append(e)
+
+        threads = []
+        for i, (b64, _) in enumerate(chunks):
+            t = threading.Thread(target=process_chunk, args=(i, b64))
+            threads.append(t)
+            t.start()
+            print(f"  Chunk {i + 1}/{len(chunks)}: sent.", flush=True)
+            if i < len(chunks) - 1:
+                time.sleep(delay)
+
+        for t in threads:
+            t.join()
+
+        if error_holder:
+            _handle_api_error(error_holder[0])
 
     ocr_elapsed = time.monotonic() - ocr_start
     if len(chunks) > 1:

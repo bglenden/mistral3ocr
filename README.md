@@ -67,7 +67,7 @@ python mistral_ocr.py document.pdf --no-images
 | `--pages PAGES` | Page range to process (0-indexed). Supports ranges (`0-4`), lists (`0,2,5`), or mixed (`0-2,5,8-10`) |
 | `--no-images` | Skip image extraction |
 | `--skip-oversized` | Skip pages that individually exceed the 50MB API limit instead of exiting |
-| `--parallel N` | Number of concurrent API requests for large file chunking (default: 2) |
+| `--rps N` | Max API requests per second for large file chunking (default: 5) |
 | `--help` | Show help message |
 
 ### Exit Codes
@@ -85,7 +85,7 @@ python mistral_ocr.py document.pdf --no-images
 
 ## Large file handling
 
-The Mistral OCR API accepts documents up to 50MB. For larger files, the tool automatically splits them into chunks at page boundaries using `pypdf`, processes chunks in parallel (2 concurrent requests), and merges the results in page order. Includes retry with exponential backoff on rate-limit errors.
+The Mistral OCR API accepts documents up to 50MB. For larger files, the tool automatically splits them into chunks at page boundaries using `pypdf`, processes chunks in parallel (submitting at up to 5 requests/second), and merges the results in page order. Includes retry with exponential backoff on rate-limit errors.
 
 ## Future Enhancements
 
