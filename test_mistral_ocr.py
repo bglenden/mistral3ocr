@@ -11,6 +11,7 @@ import pytest
 
 import mistral_ocr
 from mistral_ocr import (
+    CHUNK_SIZE_LIMIT,
     EXIT_API_ERROR,
     EXIT_AUTH_ERROR,
     EXIT_FILE_NOT_FOUND,
@@ -21,8 +22,10 @@ from mistral_ocr import (
     EXIT_SUCCESS,
     extract_and_save_images_from_base64,
     load_api_key,
+    ocr_single_chunk,
     parse_page_range,
     save_page_images,
+    split_pdf_into_chunks,
     update_image_references,
 )
 
@@ -414,3 +417,136 @@ class TestExitCodes:
 
     def test_exit_success_is_zero(self):
         assert EXIT_SUCCESS == 0
+
+
+def create_test_pdf(num_pages: int, tmp_path: Path) -> Path:
+    """Create a simple multi-page PDF for testing."""
+    from pypdf import PdfWriter
+
+    writer = PdfWriter()
+    for _ in range(num_pages):
+        writer.add_blank_page(width=612, height=792)
+    pdf_path = tmp_path / "test.pdf"
+    with open(pdf_path, "wb") as f:
+        writer.write(f)
+    return pdf_path
+
+
+class TestSplitPdfIntoChunks:
+    """Tests for split_pdf_into_chunks function."""
+
+    def test_small_file_no_chunking(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            pdf_path = create_test_pdf(5, Path(tmpdir))
+            chunks = split_pdf_into_chunks(pdf_path, None)
+
+            assert len(chunks) == 1
+            b64_str, page_indices = chunks[0]
+            assert page_indices is None  # small file, no pypdf processing
+            # Verify it's valid base64
+            raw = base64.b64decode(b64_str)
+            assert raw[:5] == b'%PDF-'
+
+    def test_large_file_splits_into_multiple_chunks(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            pdf_path = create_test_pdf(20, Path(tmpdir))
+            # Use a tiny chunk limit to force splitting
+            chunks = split_pdf_into_chunks(pdf_path, None, chunk_size_limit=1024)
+
+            assert len(chunks) > 1
+            # All original pages should be covered exactly once
+            all_pages = []
+            for _, page_indices in chunks:
+                assert page_indices is not None
+                all_pages.extend(page_indices)
+            assert sorted(all_pages) == list(range(20))
+
+    def test_page_filtering_with_chunks(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            pdf_path = create_test_pdf(10, Path(tmpdir))
+            wanted = [0, 2, 4, 6, 8]
+            chunks = split_pdf_into_chunks(pdf_path, wanted, chunk_size_limit=1024)
+
+            all_pages = []
+            for _, page_indices in chunks:
+                assert page_indices is not None
+                all_pages.extend(page_indices)
+            assert sorted(all_pages) == wanted
+
+    def test_single_page_exceeds_limit_exits(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            pdf_path = create_test_pdf(5, Path(tmpdir))
+            file_size = pdf_path.stat().st_size
+            # Set limit so low that even a single page exceeds it
+            with pytest.raises(SystemExit) as exc_info:
+                split_pdf_into_chunks(pdf_path, None, chunk_size_limit=1)
+            assert exc_info.value.code == EXIT_API_ERROR
+
+    def test_single_page_exceeds_limit_skip_oversized(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            pdf_path = create_test_pdf(5, Path(tmpdir))
+            file_size = pdf_path.stat().st_size
+            # With skip_oversized, oversized pages are dropped
+            chunks = split_pdf_into_chunks(pdf_path, None,
+                                           chunk_size_limit=1,
+                                           skip_oversized=True)
+            assert chunks == []
+
+    def test_empty_page_list_returns_empty(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # Create a PDF large enough to enter the chunking path
+            pdf_path = create_test_pdf(5, Path(tmpdir))
+            file_size = pdf_path.stat().st_size
+            # Force chunking path by setting limit below file size
+            chunks = split_pdf_into_chunks(pdf_path, [], chunk_size_limit=file_size - 1)
+
+            assert chunks == []
+
+    def test_page_indices_out_of_range_ignored(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            pdf_path = create_test_pdf(3, Path(tmpdir))
+            file_size = pdf_path.stat().st_size
+            chunks = split_pdf_into_chunks(pdf_path, [0, 1, 5, 10], chunk_size_limit=file_size - 1)
+
+            all_pages = []
+            for _, page_indices in chunks:
+                assert page_indices is not None
+                all_pages.extend(page_indices)
+            assert sorted(all_pages) == [0, 1]
+
+    def test_each_chunk_is_valid_pdf(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            pdf_path = create_test_pdf(10, Path(tmpdir))
+            chunks = split_pdf_into_chunks(pdf_path, None, chunk_size_limit=1024)
+
+            for b64_str, _ in chunks:
+                raw = base64.b64decode(b64_str)
+                assert raw[:5] == b'%PDF-'
+
+
+class TestOcrSingleChunk:
+    """Tests for ocr_single_chunk function."""
+
+    def test_calls_api_with_correct_params(self):
+        mock_client = mock.MagicMock()
+        mock_client.ocr.process.return_value = mock.MagicMock()
+
+        pdf_b64 = base64.standard_b64encode(b"%PDF-1.4 test").decode('utf-8')
+        ocr_single_chunk(mock_client, pdf_b64, include_images=True)
+
+        mock_client.ocr.process.assert_called_once_with(
+            model="mistral-ocr-latest",
+            document={
+                "type": "document_url",
+                "document_url": f"data:application/pdf;base64,{pdf_b64}",
+            },
+            include_image_base64=True,
+        )
+
+    def test_passes_no_images_flag(self):
+        mock_client = mock.MagicMock()
+        pdf_b64 = base64.standard_b64encode(b"%PDF-1.4 test").decode('utf-8')
+        ocr_single_chunk(mock_client, pdf_b64, include_images=False)
+
+        call_kwargs = mock_client.ocr.process.call_args
+        assert call_kwargs.kwargs['include_image_base64'] is False

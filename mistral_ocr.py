@@ -10,10 +10,14 @@ import base64
 import os
 import re
 import sys
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from io import BytesIO
 from pathlib import Path
 
 from dotenv import load_dotenv
 from mistralai import Mistral
+from pypdf import PdfReader, PdfWriter
 
 
 def load_api_key() -> str | None:
@@ -40,6 +44,11 @@ def load_api_key() -> str | None:
     # Fall back to environment variable
     return os.environ.get('MISTRAL_API_KEY')
 
+
+# The Mistral OCR API accepts documents up to 50MB. We target 35MB raw chunks
+# to leave margin for base64 overhead (~33%) and shared-resource duplication
+# when pypdf splits pages out of a larger file.
+CHUNK_SIZE_LIMIT = 35 * 1024 * 1024
 
 # Exit codes
 EXIT_SUCCESS = 0
@@ -227,6 +236,150 @@ def update_image_references(markdown: str, image_map: dict[str, str]) -> str:
     return markdown
 
 
+def split_pdf_into_chunks(
+    pdf_path: Path,
+    page_indices: list[int] | None,
+    chunk_size_limit: int = CHUNK_SIZE_LIMIT,
+    skip_oversized: bool = False,
+) -> list[tuple[str, list[int] | None]]:
+    """
+    Split a PDF into chunks that each fit within the API size limit.
+
+    For small files (under chunk_size_limit), returns the whole file as a single
+    chunk with no pypdf processing. For large files, uses pypdf to split into
+    multi-page chunks, measuring actual output size adaptively.
+
+    Returns a list of (base64_string, original_page_indices) tuples.
+    original_page_indices is None for small files (meaning the caller should
+    handle page filtering on the response side, preserving current behavior).
+    """
+    file_size = pdf_path.stat().st_size
+
+    # Small file: skip pypdf entirely
+    if file_size < chunk_size_limit:
+        pdf_b64 = base64.standard_b64encode(pdf_path.read_bytes()).decode('utf-8')
+        return [(pdf_b64, None)]
+
+    # Large file: split with pypdf
+    reader = PdfReader(pdf_path)
+    total_pages = len(reader.pages)
+
+    if page_indices is not None:
+        pages_to_process = [p for p in page_indices if p < total_pages]
+    else:
+        pages_to_process = list(range(total_pages))
+
+    if not pages_to_process:
+        return []
+
+    num_pages = len(pages_to_process)
+
+    # Estimate pages per chunk with a safety margin to account for
+    # shared resources being duplicated across chunks
+    avg_page_size = file_size / total_pages
+    pages_per_chunk = max(1, int(chunk_size_limit * 0.7 / avg_page_size))
+
+    num_chunks = (num_pages + pages_per_chunk - 1) // pages_per_chunk
+    print(f"Splitting {file_size / (1024 * 1024):.0f}MB file "
+          f"({num_pages} pages) into ~{num_chunks} chunks...", flush=True)
+
+    def build_chunk(page_group: list[int]) -> list[tuple[str, list[int]]]:
+        """Build a chunk from a group of pages. If it exceeds the limit,
+        split in half and recurse. Returns a list of (b64, pages) tuples."""
+        writer = PdfWriter()
+        for page_idx in page_group:
+            writer.add_page(reader.pages[page_idx])
+
+        buf = BytesIO()
+        writer.write(buf)
+        raw_size = buf.tell()
+
+        if raw_size <= chunk_size_limit:
+            chunk_b64 = base64.standard_b64encode(buf.getvalue()).decode('utf-8')
+            return [(chunk_b64, page_group)]
+
+        if len(page_group) == 1:
+            page_num = page_group[0] + 1
+            raw_mb = raw_size / (1024 * 1024)
+            limit_mb = chunk_size_limit / (1024 * 1024)
+            if skip_oversized:
+                print(f"  Warning: Skipping page {page_num} "
+                      f"({raw_mb:.0f}MB, exceeds {limit_mb:.0f}MB limit).",
+                      flush=True)
+                return []
+            else:
+                print(f"Error: Page {page_num} is {raw_mb:.0f}MB, which "
+                      f"exceeds the {limit_mb:.0f}MB API limit and cannot "
+                      f"be split further. Use --skip-oversized to skip "
+                      f"such pages and process the rest.",
+                      file=sys.stderr)
+                sys.exit(EXIT_API_ERROR)
+
+        # Over limit: split in half and retry
+        mid = len(page_group) // 2
+        return build_chunk(page_group[:mid]) + build_chunk(page_group[mid:])
+
+    # Build chunks — O(n) in the common case, O(n log n) worst case
+    chunks = []
+    for start in range(0, num_pages, pages_per_chunk):
+        group = pages_to_process[start:start + pages_per_chunk]
+        sub_chunks = build_chunk(group)
+        for b64, sub_pages in sub_chunks:
+            chunk_num = len(chunks) + 1
+            raw_mb = len(b64) * 3 / 4 / (1024 * 1024)
+            print(f"  Chunk {chunk_num}: pages {sub_pages[0]+1}-{sub_pages[-1]+1}, "
+                  f"{len(sub_pages)} pages, {raw_mb:.1f}MB", flush=True)
+            chunks.append((b64, sub_pages))
+
+    print(f"Split into {len(chunks)} chunks.", flush=True)
+
+    return chunks
+
+
+MAX_RETRIES = 3
+MAX_CONCURRENT_CHUNKS = 2
+
+
+def ocr_single_chunk(client, pdf_base64: str, include_images: bool):
+    """Send a single base64-encoded PDF to the Mistral OCR API with retry on 429."""
+    for attempt in range(MAX_RETRIES + 1):
+        try:
+            return client.ocr.process(
+                model="mistral-ocr-latest",
+                document={
+                    "type": "document_url",
+                    "document_url": f"data:application/pdf;base64,{pdf_base64}",
+                },
+                include_image_base64=include_images,
+            )
+        except Exception as e:
+            error_str = str(e).lower()
+            is_rate_limit = 'rate limit' in error_str or '429' in error_str
+            if is_rate_limit and attempt < MAX_RETRIES:
+                wait = 2 ** attempt  # 1s, 2s, 4s
+                print(f"  Rate limited, retrying in {wait}s...", flush=True)
+                time.sleep(wait)
+                continue
+            raise
+
+
+def _handle_api_error(e: Exception):
+    """Classify an API exception and exit with the appropriate code."""
+    error_str = str(e).lower()
+    if 'unauthorized' in error_str or 'authentication' in error_str or '401' in error_str:
+        print("Error: Invalid API key. Check your MISTRAL_API_KEY.", file=sys.stderr)
+        sys.exit(EXIT_AUTH_ERROR)
+    elif 'rate limit' in error_str or '429' in error_str:
+        print("Error: API rate limit exceeded. Try again later.", file=sys.stderr)
+        sys.exit(EXIT_RATE_LIMIT)
+    elif '413' in error_str or 'size limit' in error_str:
+        print("Error: Request too large for API. Try reducing the page range.", file=sys.stderr)
+        sys.exit(EXIT_API_ERROR)
+    else:
+        print(f"Error: API processing failed: {e}", file=sys.stderr)
+        sys.exit(EXIT_API_ERROR)
+
+
 def main():
     parser = argparse.ArgumentParser(
         prog='mistral-ocr',
@@ -289,6 +442,27 @@ Exit Codes:
         help='Skip image extraction. By default, images are extracted to separate files.'
     )
 
+    parser.add_argument(
+        '--skip-oversized',
+        action='store_true',
+        help='''Skip pages that individually exceed the 50MB API limit
+                (e.g. pages with very large embedded images).
+                By default, the tool exits with an error when such pages
+                are encountered. With this flag, they are skipped and the
+                remaining pages are processed.'''
+    )
+
+    parser.add_argument(
+        '--parallel',
+        type=int,
+        metavar='N',
+        default=MAX_CONCURRENT_CHUNKS,
+        help=f'''Number of concurrent API requests when processing large files
+                (>50MB) that are automatically split into chunks.
+                Default: {MAX_CONCURRENT_CHUNKS} (should work even on the free tier).
+                Set to 1 to disable parallel processing.'''
+    )
+
     args = parser.parse_args()
 
     # Validate input file
@@ -324,71 +498,110 @@ Exit Codes:
             print(f"Error: Invalid page range: {args.pages}. Use format like 0-4 or 0,2,5", file=sys.stderr)
             sys.exit(EXIT_INVALID_PAGE_RANGE)
 
-    # Read and encode PDF as base64
+    # Split PDF into chunks if needed
+    split_start = time.monotonic()
     try:
-        pdf_data = input_path.read_bytes()
-        pdf_base64 = base64.standard_b64encode(pdf_data).decode('utf-8')
+        chunks = split_pdf_into_chunks(input_path, pages,
+                                       skip_oversized=args.skip_oversized)
     except IOError as e:
         print(f"Error: Cannot read file: {input_path}: {e}", file=sys.stderr)
         sys.exit(EXIT_FILE_NOT_FOUND)
+    split_elapsed = time.monotonic() - split_start
+
+    if not chunks:
+        print("Error: No pages to process.", file=sys.stderr)
+        sys.exit(EXIT_INVALID_PAGE_RANGE)
+
+    if len(chunks) > 1:
+        print(f"Splitting took {split_elapsed:.1f}s.", flush=True)
 
     # Initialize Mistral client
     client = Mistral(api_key=api_key)
-
-    # Build OCR request parameters
     include_images = not args.no_images
 
-    # Call OCR API
-    try:
-        ocr_response = client.ocr.process(
-            model="mistral-ocr-latest",
-            document={
-                "type": "document_url",
-                "document_url": f"data:application/pdf;base64,{pdf_base64}",
-            },
-            include_image_base64=include_images,
-        )
-    except Exception as e:
-        error_str = str(e).lower()
-
-        if 'unauthorized' in error_str or 'authentication' in error_str or '401' in error_str:
-            print("Error: Invalid API key. Check your MISTRAL_API_KEY.", file=sys.stderr)
-            sys.exit(EXIT_AUTH_ERROR)
-        elif 'rate limit' in error_str or '429' in error_str:
-            print("Error: API rate limit exceeded. Try again later.", file=sys.stderr)
-            sys.exit(EXIT_RATE_LIMIT)
-        else:
-            print(f"Error: API processing failed: {e}", file=sys.stderr)
-            sys.exit(EXIT_API_ERROR)
-
-    # Extract markdown and images from response
-    markdown_parts = []
-    all_image_maps = {}
-    image_counter = 0
+    # Process chunks — parallel for multiple chunks, simple for single chunk
     output_stem = input_path.stem
     images_dir = input_path.parent / f"{output_stem}_images"
 
-    if hasattr(ocr_response, 'pages') and ocr_response.pages:
-        for i, page in enumerate(ocr_response.pages):
-            # Filter by page range if specified
-            if pages is not None and i not in pages:
-                continue
+    ocr_start = time.monotonic()
 
-            if hasattr(page, 'markdown') and page.markdown:
-                markdown_parts.append(page.markdown)
+    if len(chunks) == 1:
+        # Single chunk: no threading overhead
+        chunk_b64, chunk_page_indices = chunks[0]
+        try:
+            ocr_responses = [ocr_single_chunk(client, chunk_b64, include_images)]
+        except Exception as e:
+            _handle_api_error(e)
+    else:
+        # Multiple chunks: process in parallel
+        num_workers = min(args.parallel, len(chunks))
+        print(f"Processing {len(chunks)} chunks "
+              f"({num_workers} concurrent)...", flush=True)
+        ocr_responses = [None] * len(chunks)
+        chunk_times = {}
 
-            # Extract images from this page if enabled
-            if include_images:
-                if not images_dir.exists():
-                    images_dir.mkdir(exist_ok=True)
-                image_map, image_counter = save_page_images(page, images_dir, image_counter)
-                all_image_maps.update(image_map)
+        def process_chunk(idx, b64):
+            chunk_start = time.monotonic()
+            print(f"  Chunk {idx + 1}/{len(chunks)}: sending...", flush=True)
+            result = ocr_single_chunk(client, b64, include_images)
+            elapsed = time.monotonic() - chunk_start
+            chunk_times[idx] = elapsed
+            print(f"  Chunk {idx + 1}/{len(chunks)}: done ({elapsed:.1f}s).",
+                  flush=True)
+            return idx, result
+
+        with ThreadPoolExecutor(max_workers=num_workers) as executor:
+            futures = {
+                executor.submit(process_chunk, i, b64): i
+                for i, (b64, _) in enumerate(chunks)
+            }
+            try:
+                for future in as_completed(futures):
+                    idx, result = future.result()
+                    ocr_responses[idx] = result
+            except Exception as e:
+                # Cancel remaining futures on error
+                for f in futures:
+                    f.cancel()
+                _handle_api_error(e)
+
+    ocr_elapsed = time.monotonic() - ocr_start
+    if len(chunks) > 1:
+        serial_total = sum(chunk_times.values())
+        print(f"OCR completed in {ocr_elapsed:.1f}s wall-clock "
+              f"({serial_total:.1f}s total across {len(chunks)} chunks).",
+              flush=True)
+
+    # Assemble markdown and images from responses in order
+    markdown_parts = []
+    image_counter = 0
+
+    for chunk_idx, ocr_response in enumerate(ocr_responses):
+        chunk_page_indices = chunks[chunk_idx][1]
+        chunk_image_map = {}
+        chunk_md_start = len(markdown_parts)
+
+        if hasattr(ocr_response, 'pages') and ocr_response.pages:
+            for i, page in enumerate(ocr_response.pages):
+                # For small files (chunk_page_indices is None), filter on response side
+                if chunk_page_indices is None and pages is not None and i not in pages:
+                    continue
+
+                if hasattr(page, 'markdown') and page.markdown:
+                    markdown_parts.append(page.markdown)
+
+                if include_images:
+                    if not images_dir.exists():
+                        images_dir.mkdir(exist_ok=True)
+                    image_map, image_counter = save_page_images(page, images_dir, image_counter)
+                    chunk_image_map.update(image_map)
+
+        # Update image references for this chunk's pages only
+        if chunk_image_map:
+            for j in range(chunk_md_start, len(markdown_parts)):
+                markdown_parts[j] = update_image_references(markdown_parts[j], chunk_image_map)
 
     markdown_content = '\n\n'.join(markdown_parts)
-
-    # Update image references in markdown
-    if all_image_maps:
-        markdown_content = update_image_references(markdown_content, all_image_maps)
 
     # Also handle any inline base64 images (fallback)
     if include_images and 'data:image' in markdown_content:

@@ -33,6 +33,7 @@ htmlcov/
 # Test files
 test_document.pdf
 test_document.md
+test_data_proprietary_not_in_github/
 
 # Output files
 *_images/

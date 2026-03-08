@@ -12,6 +12,7 @@ See [Mistral's OCR 3 announcement](https://mistral.ai/news/mistral-ocr-3) for de
 ## Features
 
 - Converts PDF documents to clean Markdown format
+- Automatic chunking of large PDFs (>50MB) with parallel API processing
 - Extracts and saves embedded images
 - Preserves tables in Markdown format
 - Supports page range selection
@@ -65,6 +66,8 @@ python mistral_ocr.py document.pdf --no-images
 |--------|-------------|
 | `--pages PAGES` | Page range to process (0-indexed). Supports ranges (`0-4`), lists (`0,2,5`), or mixed (`0-2,5,8-10`) |
 | `--no-images` | Skip image extraction |
+| `--skip-oversized` | Skip pages that individually exceed the 50MB API limit instead of exiting |
+| `--parallel N` | Number of concurrent API requests for large file chunking (default: 2) |
 | `--help` | Show help message |
 
 ### Exit Codes
@@ -80,13 +83,13 @@ python mistral_ocr.py document.pdf --no-images
 | 6 | API processing error |
 | 7 | Invalid page range |
 
-## Limitations
+## Large file handling
 
-- **50MB file size limit**: The Mistral OCR API accepts documents up to 50MB. For larger files, split them manually using a tool like `pdftk` or `qpdf` before processing. Use the `--pages` option to process specific page ranges.
+The Mistral OCR API accepts documents up to 50MB. For larger files, the tool automatically splits them into chunks at page boundaries using `pypdf`, processes chunks in parallel (2 concurrent requests), and merges the results in page order. Includes retry with exponential backoff on rate-limit errors.
 
 ## Future Enhancements
 
-- [ ] Automatic chunking of large PDFs (>50MB)
+- [ ] User-provided correction filters (e.g. `--corrections corrections.json`) to fix known OCR errors for specific document types without baking domain-specific logic into the tool
 
 ## Development
 
